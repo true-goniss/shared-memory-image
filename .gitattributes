@@ -1,4 +1,4 @@
-* linguist-language=С++
+src/** linguist-language=С++
 
 *.cs linguist-language=C#
 *.js linguist-language=JavaScript
