@@ -2,3 +2,5 @@
 
 *.cs linguist-language=C#
 *.js linguist-language=JavaScript
+
+*Form1.cs linguist-documentation
