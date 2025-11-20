@@ -392,4 +392,5 @@ void SharedMemory::GetMetadata(const FunctionCallbackInfo<Value>& args) {
     args.GetReturnValue().Set(ret);
 }
 
+
 NODE_MODULE(NODE_GYP_MODULE_NAME, SharedMemory::Init)
