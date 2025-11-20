@@ -7,13 +7,15 @@
 
 #include <node.h>
 #include <node_buffer.h>
+#include <node_object_wrap.h> // class instances
 #include <Windows.h>
 #include <cstdint>
 #include <cstring>
-#include <memory>
 #include <string>
+#include <emmintrin.h> // _mm_pause()
 
 using v8::FunctionCallbackInfo;
+using v8::FunctionTemplate;
 using v8::Isolate;
 using v8::Local;
 using v8::Object;
@@ -21,10 +23,10 @@ using v8::String;
 using v8::Value;
 using v8::Number;
 using v8::Integer;
-using v8::ArrayBuffer;
-using v8::Uint8Array;
-using v8::Exception;
 using v8::Boolean;
+using v8::Context;
+using v8::Exception;
+using v8::Function;
 
 #define SHARED_MAGIC 0x5348444D
 
@@ -49,472 +51,345 @@ static void noop_free(char* /*data*/, void* /*hint*/) { /* no-op */ }
 // Shared header layout
 #pragma pack(push,1)
 struct SharedHeader {
-  uint32_t magic;          // 0x5348444D 'SHDM'
-  uint32_t version;        // 1
-  volatile LONG seq;       // sequence counter (seqlock) - 32-bit
+  uint32_t magic;        // 0x5348444D 'SHDM'
+  uint32_t version;      // 1
+  volatile LONG seq;     // sequence counter (seqlock)
   uint32_t width;
   uint32_t height;
   uint32_t channels;
-  uint32_t frame_size;     // bytes of current frame
-  uint64_t frame_index;    // ever increasing frame counter (64-bit)
-  uint64_t mapping_size;   // total mapping size written by creator
-  uint8_t reserved[48];    // pad to 80+ bytes for future use/alignment
+  uint32_t frame_size;   // bytes of current frame
+  uint64_t frame_index;  // ever increasing frame counter
+  uint64_t mapping_size; // total mapping size
+  uint8_t reserved[48];
 };
 #pragma pack(pop)
 
-static HANDLE g_hMap = nullptr;
-static void* g_base = nullptr;
-static size_t g_mapSize = 0;
-static HANDLE g_hEvent = nullptr;
-static std::string g_eventName;
-static const uint32_t MAGIC = SHARED_MAGIC;
-static const uint32_t VERSION = 1;
-static const size_t HEADER_SIZE = ((sizeof(SharedHeader) + 63) / 64) * 64; // 64 byte aligned header
-static size_t dataOffset() { return HEADER_SIZE; }
+static const size_t HEADER_SIZE = ((sizeof(SharedHeader) + 63) / 64) * 64;
 
-static SharedHeader* headerPtr() {
-  return reinterpret_cast<SharedHeader*>((uint8_t*)g_base);
+class SharedMemory : public node::ObjectWrap {
+public:
+  static void Init(Local<Object> exports);
+
+private:
+  explicit SharedMemory();
+  ~SharedMemory();
+
+  static void New(const FunctionCallbackInfo<Value>& args);
+  
+  // Methods mapped to JS
+  static void Create(const FunctionCallbackInfo<Value>& args);
+  static void SetFormat(const FunctionCallbackInfo<Value>& args);
+  static void GetFrameBuffer(const FunctionCallbackInfo<Value>& args);
+  static void GetCapacity(const FunctionCallbackInfo<Value>& args);
+  static void PublishFrame(const FunctionCallbackInfo<Value>& args);
+  static void ReadFrame(const FunctionCallbackInfo<Value>& args);
+  static void Close(const FunctionCallbackInfo<Value>& args);
+  static void GetMetadata(const FunctionCallbackInfo<Value>& args);
+
+  // Internal helpers
+  SharedHeader* headerPtr() { return reinterpret_cast<SharedHeader*>((uint8_t*)base_); }
+  void* dataPtr() { return (uint8_t*)base_ + HEADER_SIZE; }
+  size_t dataCapacity();
+
+  // Member variables
+  HANDLE hMap_ = nullptr;
+  void* base_ = nullptr;
+  size_t mapSize_ = 0;
+  HANDLE hEvent_ = nullptr;
+  std::string eventName_;
+};
+
+// --- Implementation ---
+
+SharedMemory::SharedMemory() {}
+
+SharedMemory::~SharedMemory() {
+  if (base_) UnmapViewOfFile(base_);
+  if (hMap_) CloseHandle(hMap_);
+  if (hEvent_) CloseHandle(hEvent_);
 }
 
-static void* dataPtr() {
-  return (uint8_t*)g_base + dataOffset();
+size_t SharedMemory::dataCapacity() {
+  if (mapSize_ <= HEADER_SIZE) return 0;
+  return mapSize_ - HEADER_SIZE;
 }
 
-static size_t dataCapacity() {
-  if (g_mapSize <= dataOffset()) return 0;
-  return g_mapSize - dataOffset();
+void SharedMemory::Init(Local<Object> exports) {
+  Isolate* isolate = exports->GetIsolate();
+  Local<Context> context = isolate->GetCurrentContext();
+
+  Local<FunctionTemplate> tpl = FunctionTemplate::New(isolate, New);
+  tpl->SetClassName(String::NewFromUtf8(isolate, "SharedMemory").ToLocalChecked());
+  tpl->InstanceTemplate()->SetInternalFieldCount(1);
+
+  // Prototype methods
+  NODE_SET_PROTOTYPE_METHOD(tpl, "create", Create);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "setFormat", SetFormat);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "getFrameBuffer", GetFrameBuffer);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "getCapacity", GetCapacity);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "publishFrame", PublishFrame);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "readFrame", ReadFrame);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "close", Close);
+  NODE_SET_PROTOTYPE_METHOD(tpl, "getMetadata", GetMetadata);
+
+  Local<Function> constructor = tpl->GetFunction(context).ToLocalChecked();
+  exports->Set(context, String::NewFromUtf8(isolate, "SharedMemory").ToLocalChecked(), constructor).Check();
 }
 
-/*
-Get mapping region size via VirtualQuery
-*/  
-static size_t queryRegionSize(void* addr) {
-  MEMORY_BASIC_INFORMATION mbi;
-  if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) return 0;
-  return mbi.RegionSize;
-}
-
-/*
-Create or open mapping and event
-*/  
-void CreateSharedMemory(const FunctionCallbackInfo<Value>& args) {
+void SharedMemory::New(const FunctionCallbackInfo<Value>& args) {
   Isolate* isolate = args.GetIsolate();
+  Local<Context> context = isolate->GetCurrentContext();
 
-  if (args.Length() < 2) {
-    isolate->ThrowException(
-      Exception::TypeError(
-        String::NewFromUtf8(isolate, "create(name, size[,width,height,channels]) expects at least 2 args").ToLocalChecked()
-      ));
+  if (args.IsConstructCall()) {
+    // been called with 'new SharedMemory()' - ok
+    SharedMemory* obj = new SharedMemory();
+    obj->Wrap(args.This());
+    args.GetReturnValue().Set(args.This());
+  } else {
+    // been called as 'SharedMemory()' without new;
+    // throwing an exception.
+    isolate->ThrowException(Exception::TypeError(
+        String::NewFromUtf8(isolate, "Class constructors cannot be invoked without 'new'").ToLocalChecked()));
+  }
+}
+
+// --- Method Implementations ---
+
+void SharedMemory::Create(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  SharedMemory* obj = ObjectWrap::Unwrap<SharedMemory>(args.Holder());
+
+  if (args.Length() < 2 || !args[0]->IsString() || !args[1]->IsNumber()) {
+    isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Args: name, size").ToLocalChecked()));
     return;
   }
 
-  if (!args[0]->IsString() || !args[1]->IsNumber()) {
-    isolate->ThrowException(
-      Exception::TypeError(
-        String::NewFromUtf8(isolate, "Wrong args").ToLocalChecked()
-      ));
-    return;
-  }
+  // Cleanup if already opened
+  if (obj->base_) { UnmapViewOfFile(obj->base_); obj->base_ = nullptr; }
+  if (obj->hMap_) { CloseHandle(obj->hMap_); obj->hMap_ = nullptr; }
 
-  v8::String::Utf8Value name(isolate, args[0]);
+  String::Utf8Value name(isolate, args[0]);
   std::string mapName(*name);
   uint64_t requestedSize = (uint64_t)args[1]->IntegerValue(isolate->GetCurrentContext()).FromJust();
 
   uint32_t width = 0, height = 0, channels = 0;
-  bool isCreator = false;
-
-  if (args.Length() >= 5 && args[2]->IsNumber() && args[3]->IsNumber() && args[4]->IsNumber()) {
+  if (args.Length() >= 5) {
     width = (uint32_t)args[2]->IntegerValue(isolate->GetCurrentContext()).FromJust();
     height = (uint32_t)args[3]->IntegerValue(isolate->GetCurrentContext()).FromJust();
     channels = (uint32_t)args[4]->IntegerValue(isolate->GetCurrentContext()).FromJust();
   }
 
-  // Ensure minimally large mapping to contain header
-  if (requestedSize < HEADER_SIZE + 4) {
-    isolate->ThrowException(
-      Exception::Error(
-        String::NewFromUtf8(isolate, "Requested size too small").ToLocalChecked()
-      ));
-    return;
-  }
+  obj->hMap_ = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, mapName.c_str());
+  bool isCreator = false;
 
-  // Try to open an existing mapping
-  g_hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, mapName.c_str());
-
-  if (g_hMap == nullptr) {
-    // Create new mapping
+  if (!obj->hMap_) {
     DWORD sizeLow = static_cast<DWORD>(requestedSize & 0xFFFFFFFF);
     DWORD sizeHigh = static_cast<DWORD>((requestedSize >> 32) & 0xFFFFFFFF);
-
-    g_hMap = CreateFileMappingA(
-      INVALID_HANDLE_VALUE, 
-      nullptr, 
-      PAGE_READWRITE, 
-      sizeHigh, 
-      sizeLow, 
-      mapName.c_str()
-    );
-
-    if (g_hMap == nullptr) {
-      isolate->ThrowException(
-        Exception::Error(
-          String::NewFromUtf8(isolate, "Could not create file mapping object").ToLocalChecked()
-        ));
+    obj->hMap_ = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, sizeHigh, sizeLow, mapName.c_str());
+    if (!obj->hMap_) {
+      isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "CreateFileMapping failed").ToLocalChecked()));
       return;
     }
-
     isCreator = true;
   }
 
-  // Map entire mapping (0 = whole object)
-  g_base = MapViewOfFile(g_hMap, FILE_MAP_ALL_ACCESS, 0, 0, 0);
-  if (g_base == nullptr) {
-    CloseHandle(g_hMap);
-    g_hMap = nullptr;
-    isolate->ThrowException(
-      Exception::Error(
-        String::NewFromUtf8(isolate, "Could not map view of file").ToLocalChecked()
-      ));
+  obj->base_ = MapViewOfFile(obj->hMap_, FILE_MAP_ALL_ACCESS, 0, 0, 0);
+  if (!obj->base_) {
+    isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "MapViewOfFile failed").ToLocalChecked()));
     return;
   }
 
-  // Query actual mapping size (always reliable)
-  size_t regionSize = queryRegionSize(g_base);
-  if (regionSize == 0) {
-    UnmapViewOfFile(g_base);
-    g_base = nullptr;
-    CloseHandle(g_hMap);
-    g_hMap = nullptr;
-    isolate->ThrowException(
-      Exception::Error(
-        String::NewFromUtf8(isolate, "Could not query mapping size").ToLocalChecked()
-      ));
-    return;
-  }
-  g_mapSize = regionSize;
+  MEMORY_BASIC_INFORMATION mbi;
+  VirtualQuery(obj->base_, &mbi, sizeof(mbi));
+  obj->mapSize_ = mbi.RegionSize;
 
-  // Create/open named event
-  g_eventName = "Global\\SHM_EV_" + mapName;
-  g_hEvent = OpenEventA(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, g_eventName.c_str());
-  
-  if (g_hEvent == nullptr) {
-    g_eventName = "Local\\SHM_EV_" + mapName;
-    g_hEvent = CreateEventA(nullptr, FALSE, FALSE, g_eventName.c_str());
-    // no event, but not fatal
+  // Event setup
+  obj->eventName_ = "Global\\SHM_EV_" + mapName;
+  obj->hEvent_ = OpenEventA(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, obj->eventName_.c_str());
+  if (!obj->hEvent_) {
+    obj->eventName_ = "Local\\SHM_EV_" + mapName;
+    obj->hEvent_ = CreateEventA(nullptr, FALSE, FALSE, obj->eventName_.c_str());
   }
 
-  SharedHeader* hdr = headerPtr();
+  SharedHeader* hdr = obj->headerPtr();
   if (isCreator) {
     // Initialize header
     ZeroMemory(hdr, sizeof(SharedHeader));
-    hdr->magic = MAGIC;
-    hdr->version = VERSION;
-    hdr->seq = 0;
+    hdr->magic = SHARED_MAGIC;
+    hdr->version = 1;
     hdr->width = width;
     hdr->height = height;
     hdr->channels = channels;
-    hdr->frame_size = 0;
-    hdr->frame_index = 0;
-    hdr->mapping_size = static_cast<uint64_t>(regionSize);
-  } else {
-    // Validate header
-    if (hdr->magic != MAGIC || hdr->version != VERSION) {
-      UnmapViewOfFile(g_base);
-      g_base = nullptr;
-      CloseHandle(g_hMap);
-      g_hMap = nullptr;
-      if (g_hEvent) { CloseHandle(g_hEvent); g_hEvent = nullptr; }
-
-      isolate->ThrowException(
-        Exception::Error(
-          String::NewFromUtf8(isolate, "Mapping format mismatch (magic/version)").ToLocalChecked()
-        ));
-      return;
-    }
+    hdr->mapping_size = obj->mapSize_;
   }
 
   args.GetReturnValue().Set(String::NewFromUtf8(isolate, "ok").ToLocalChecked());
 }
 
-/*
-Set format
-*/
-void SetFormat(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
+void SharedMemory::SetFormat(const FunctionCallbackInfo<Value>& args) {
+  SharedMemory* obj = ObjectWrap::Unwrap<SharedMemory>(args.Holder());
+  if (!obj->base_) return;
 
-  if (g_base == nullptr) {
-    isolate->ThrowException(
-      Exception::Error(
-        String::NewFromUtf8(isolate, "Shared memory not created").ToLocalChecked()
-      )
-    );
-    return;
-  }
+  uint32_t w = args[0]->IntegerValue(args.GetIsolate()->GetCurrentContext()).FromJust();
+  uint32_t h = args[1]->IntegerValue(args.GetIsolate()->GetCurrentContext()).FromJust();
+  uint32_t c = args[2]->IntegerValue(args.GetIsolate()->GetCurrentContext()).FromJust();
 
-  // Arguments exception
-  if (args.Length() < 3 ||
-      !args[0]->IsNumber() ||
-      !args[1]->IsNumber() ||
-      !args[2]->IsNumber()
-  ) {
-    isolate->ThrowException(
-      Exception::TypeError(
-        String::NewFromUtf8(isolate, "setFormat(width,height,channels) expects 3 numbers").ToLocalChecked())
-    );
-    return;
-  }
-
-  uint32_t w = static_cast<uint32_t>(args[0]->IntegerValue(isolate->GetCurrentContext()).FromJust());
-  uint32_t h = static_cast<uint32_t>(args[1]->IntegerValue(isolate->GetCurrentContext()).FromJust());
-  uint32_t c = static_cast<uint32_t>(args[2]->IntegerValue(isolate->GetCurrentContext()).FromJust());
-
-  // Invalid format exception
-  if (w == 0 ||
-      h == 0 ||
-      (c != 3 && c != 4)
-  ) {
-    isolate->ThrowException(
-      Exception::Error(
-        String::NewFromUtf8(isolate, "Invalid format").ToLocalChecked()
-      )
-    );
-    return;
-  }
-
-  SharedHeader* hdr = headerPtr();
-
-  // seqlock write - changing format
-  InterlockedIncrement(&hdr->seq); // odd (32-bit)
+  SharedHeader* hdr = obj->headerPtr();
+  InterlockedIncrement(&hdr->seq);
   MemoryBarrier();
-  hdr->width = w;
-  hdr->height = h;
-  hdr->channels = c;
-  // frame_size left as is, it's been set at publishFrame()
+  hdr->width = w; hdr->height = h; hdr->channels = c;
   MemoryBarrier();
-  InterlockedIncrement(&hdr->seq); // even
+  InterlockedIncrement(&hdr->seq);
 
-  if (g_hEvent)
-    SetEvent(g_hEvent);
-
-  args.GetReturnValue().Set(
-    Boolean::New(isolate, true)
-  );
+  if (obj->hEvent_) SetEvent(obj->hEvent_);
+  args.GetReturnValue().Set(true);
 }
 
-
-/*
-Return a zero-copy Node Buffer pointing to data area
-*/
-void GetFrameBuffer(const FunctionCallbackInfo<Value>& args) {
+void SharedMemory::GetFrameBuffer(const FunctionCallbackInfo<Value>& args) {
   Isolate* isolate = args.GetIsolate();
-
-  if (g_base == nullptr) {
-    isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Shared memory not created").ToLocalChecked()));
+  SharedMemory* obj = ObjectWrap::Unwrap<SharedMemory>(args.Holder());
+  
+  if (!obj->base_ || obj->dataCapacity() == 0) {
+    args.GetReturnValue().Set(v8::Null(isolate));
     return;
   }
 
-  size_t cap = dataCapacity();
-  if (cap == 0) {
-    isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "No capacity").ToLocalChecked()));
-    return;
-  }
-
-  char* ptr = static_cast<char*>(dataPtr());
-
-  // Create external Buffer that points directly into mapping.
-  Local<v8::Object> buf = node::Buffer::New(isolate, ptr, cap, noop_free, nullptr).ToLocalChecked();
-
+  // Zero-Copy view of the memory
+  char* ptr = static_cast<char*>(obj->dataPtr());
+  Local<Object> buf = node::Buffer::New(isolate, ptr, obj->dataCapacity(), noop_free, nullptr).ToLocalChecked();
   args.GetReturnValue().Set(buf);
 }
 
-void GetCapacity(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
-  if (g_base == nullptr) {
-    isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Shared memory not created").ToLocalChecked()));
-    return;
-  }
-  args.GetReturnValue().Set(
-    Number::New(isolate, static_cast<double>(dataCapacity()))
-  );
+void SharedMemory::GetCapacity(const FunctionCallbackInfo<Value>& args) {
+  SharedMemory* obj = ObjectWrap::Unwrap<SharedMemory>(args.Holder());
+  args.GetReturnValue().Set(Number::New(args.GetIsolate(), (double)obj->dataCapacity()));
 }
 
-// Writer: publish frame metadata and signal event
-// publishFrame(frameBytes)
-void PublishFrame(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
-  if (g_base == nullptr) {
-    isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Shared memory not created").ToLocalChecked()));
-    return;
-  }
-  if (args.Length() < 1 || !args[0]->IsNumber()) {
-    isolate->ThrowException(Exception::TypeError(String::NewFromUtf8(isolate, "Expected frame size").ToLocalChecked()));
-    return;
-  }
+void SharedMemory::PublishFrame(const FunctionCallbackInfo<Value>& args) {
+  SharedMemory* obj = ObjectWrap::Unwrap<SharedMemory>(args.Holder());
+  if (!obj->base_) return;
 
-  uint32_t frameBytes = static_cast<uint32_t>(args[0]->IntegerValue(isolate->GetCurrentContext()).FromJust());
-  if (frameBytes > dataCapacity()) {
-    isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Frame too large").ToLocalChecked()));
-    return;
-  }
+  uint32_t frameBytes = args[0]->IntegerValue(args.GetIsolate()->GetCurrentContext()).FromJust();
+  if (frameBytes > obj->dataCapacity()) return;
 
-  SharedHeader* hdr = headerPtr();
-
-  // seqlock write:
-  InterlockedIncrement(&hdr->seq); // become odd (writer in-progress)
+  SharedHeader* hdr = obj->headerPtr();
+  InterlockedIncrement(&hdr->seq); // Start write
   MemoryBarrier();
-
+  
   hdr->frame_size = frameBytes;
-  // bump 64-bit index correctly:
-  AtomicIncrement64(reinterpret_cast<volatile LONG64*>(&hdr->frame_index));
-
+  AtomicIncrement64((volatile LONG64*)&hdr->frame_index);
+  
   MemoryBarrier();
-  InterlockedIncrement(&hdr->seq); // become even (writer done)
+  InterlockedIncrement(&hdr->seq); // End write
 
-  // signal event so readers can wake up
-  if (g_hEvent != nullptr) SetEvent(g_hEvent);
-
-  args.GetReturnValue().Set(Boolean::New(isolate, true));
+  if (obj->hEvent_) SetEvent(obj->hEvent_);
+  args.GetReturnValue().Set(true);
 }
 
-/*
-Node test reader: read latest frame into a newly allocated Buffer (copy)
-readFrame([timeoutMs]) -> Buffer or null if timeout
-*/
-void ReadFrame(const FunctionCallbackInfo<Value>& args) {
+void SharedMemory::ReadFrame(const FunctionCallbackInfo<Value>& args) {
   Isolate* isolate = args.GetIsolate();
-
-  if (g_base == nullptr) {
-    isolate->ThrowException(
-      Exception::Error(
-        String::NewFromUtf8(isolate, "Shared memory not created").ToLocalChecked()
-      )
-    );
-    return;
+  SharedMemory* obj = ObjectWrap::Unwrap<SharedMemory>(args.Holder());
+  
+  if (!obj->base_) {
+     isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Not connected").ToLocalChecked()));
+     return;
   }
 
-  DWORD timeout = 0;
-  if (args.Length() >= 1 && args[0]->IsNumber()) {
-    timeout = static_cast<DWORD>(args[0]->IntegerValue(isolate->GetCurrentContext()).FromJust());
-  } else {
-    timeout = INFINITE;
+  DWORD timeout = INFINITE;
+  if (args.Length() > 0 && args[0]->IsNumber()) {
+    timeout = args[0]->IntegerValue(isolate->GetCurrentContext()).FromJust();
   }
 
-  SharedHeader* hdr = headerPtr();
-
-  // Wait on event if available
-  if (g_hEvent != nullptr) {
-    DWORD w = WaitForSingleObject(g_hEvent, timeout);
-    if (w == WAIT_TIMEOUT) {
+  // Wait for event (sleeping wait)
+  if (obj->hEvent_) {
+    if (WaitForSingleObject(obj->hEvent_, timeout) == WAIT_TIMEOUT) {
       args.GetReturnValue().Set(v8::Null(isolate));
       return;
     }
-  } else {
-    // no event: fall through (busy-check)
   }
 
-  // seqlock read: try until consistent
-  uint32_t start, end;
-  uint32_t frameBytes = 0;
-  uint64_t frameIndex = 0;
-  const int maxAttempts = 10;
-  int attempts = 0;
+  SharedHeader* hdr = obj->headerPtr();
+  uint32_t startSeq, endSeq;
+  uint32_t frameBytes;
+  const int MAX_RETRIES = 10;
+  int retries = 0;
+  
+  // Seqlock read loop with spin-wait
+  int spinCount = 0;
+  const int SPIN_LIMIT = 2000; // Cycles to spin before yielding
+
   do {
-    if (++attempts > maxAttempts) {
-      isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Failed to read stable frame (too many retries)").ToLocalChecked()));
-      return;
+    if (retries++ > MAX_RETRIES) {
+       isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "ReadFrame contention").ToLocalChecked()));
+       return;
     }
-    start = hdr->seq;
-    if (start & 1) { // writer in progress
-      Sleep(0);
-      continue;
+
+    startSeq = hdr->seq;
+    
+    // if seq number is odd, then write is in progress, waiting...
+    if (startSeq & 1) {
+        if (spinCount < SPIN_LIMIT) {
+            spinCount++;
+            _mm_pause(); 
+            continue;
+        } else {
+            Sleep(0);    // if waited too long
+            spinCount = 0;
+            continue;
+        }
     }
 
     MemoryBarrier();
     frameBytes = hdr->frame_size;
-    frameIndex = hdr->frame_index;
+    if (frameBytes > obj->dataCapacity()) frameBytes = 0;
 
-    if (frameBytes > dataCapacity()) {
-      isolate->ThrowException(Exception::Error(String::NewFromUtf8(isolate, "Frame size invalid").ToLocalChecked()));
-      return;
+    // Copying data (deep copy)
+    Local<Object> outBuf;
+    if (frameBytes > 0) {
+        outBuf = node::Buffer::Copy(isolate, (char*)obj->dataPtr(), frameBytes).ToLocalChecked();
+    } else {
+        outBuf = node::Buffer::New(isolate, 0).ToLocalChecked();
     }
 
-    // copy data to new Buffer
-    char* src = static_cast<char*>(dataPtr());
-    Local<v8::Object> outbuf = node::Buffer::Copy(isolate, src, frameBytes).ToLocalChecked();
     MemoryBarrier();
-    end = hdr->seq;
-    if (start != end) {
-      // inconsistent; try again
-      continue;
+    endSeq = hdr->seq;
+
+    if (startSeq == endSeq) {
+       // Read successfully
+       args.GetReturnValue().Set(outBuf);
+       return;
     }
 
-    // attach meta? we'll return Buffer only.
-    args.GetReturnValue().Set(outbuf);
-    return;
+    // if seq was changed when reading, then image tearing happened, trying again  
+    // Reset spin count to try eagerly again
+    spinCount = 0;
+
   } while (true);
 }
 
-/*
-Close/unmap
-*/
-void CloseSharedMemory(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
-  if (g_base != nullptr) {
-    UnmapViewOfFile(g_base);
-    g_base = nullptr;
-  }
-  if (g_hMap != nullptr) {
-    CloseHandle(g_hMap);
-    g_hMap = nullptr;
-  }
-  if (g_hEvent != nullptr) {
-    CloseHandle(g_hEvent);
-    g_hEvent = nullptr;
-  }
-  g_mapSize = 0;
-  args.GetReturnValue().Set(Boolean::New(isolate, true));
+void SharedMemory::Close(const FunctionCallbackInfo<Value>& args) {
+  SharedMemory* obj = ObjectWrap::Unwrap<SharedMemory>(args.Holder());
+  if (obj->base_) { UnmapViewOfFile(obj->base_); obj->base_ = nullptr; }
+  if (obj->hMap_) { CloseHandle(obj->hMap_); obj->hMap_ = nullptr; }
+  if (obj->hEvent_) { CloseHandle(obj->hEvent_); obj->hEvent_ = nullptr; }
+  args.GetReturnValue().Set(true);
 }
 
-/*
-Get metadata
-*/
-void GetMetadata(const FunctionCallbackInfo<Value>& args) {
-  Isolate* isolate = args.GetIsolate();
+void SharedMemory::GetMetadata(const FunctionCallbackInfo<Value>& args) {
+    Isolate* isolate = args.GetIsolate();
+    SharedMemory* obj = ObjectWrap::Unwrap<SharedMemory>(args.Holder());
+    if (!obj->base_) return;
 
-  if (g_base == nullptr) {
-    isolate->ThrowException(
-      Exception::Error(
-        String::NewFromUtf8(isolate, "Shared memory not created").ToLocalChecked()
-      )
-    );
-    return;
-  }
-
-  SharedHeader* hdr = headerPtr();
-  Local<Object> out = Object::New(isolate);
-  Local<v8::Context> ctx = isolate->GetCurrentContext();
-
-  out->Set(ctx, String::NewFromUtf8(isolate, "width").ToLocalChecked(), Integer::New(isolate, hdr->width)).Check();
-  out->Set(ctx, String::NewFromUtf8(isolate, "height").ToLocalChecked(), Integer::New(isolate, hdr->height)).Check();
-  out->Set(ctx, String::NewFromUtf8(isolate, "channels").ToLocalChecked(), Integer::New(isolate, hdr->channels)).Check();
-  out->Set(ctx, String::NewFromUtf8(isolate, "frame_size").ToLocalChecked(), Integer::New(isolate, hdr->frame_size)).Check();
-
-  out->Set(ctx,
-           String::NewFromUtf8(isolate, "frame_index").ToLocalChecked(),
-           v8::BigInt::NewFromUnsigned(isolate, hdr->frame_index)).Check();
-
-  args.GetReturnValue().Set(out);
+    SharedHeader* hdr = obj->headerPtr();
+    Local<Object> ret = Object::New(isolate);
+    Local<Context> ctx = isolate->GetCurrentContext();
+    
+    ret->Set(ctx, String::NewFromUtf8(isolate, "width").ToLocalChecked(), Integer::New(isolate, hdr->width));
+    ret->Set(ctx, String::NewFromUtf8(isolate, "height").ToLocalChecked(), Integer::New(isolate, hdr->height));
+    ret->Set(ctx, String::NewFromUtf8(isolate, "channels").ToLocalChecked(), Integer::New(isolate, hdr->channels));
+    ret->Set(ctx, String::NewFromUtf8(isolate, "frame_index").ToLocalChecked(), Number::New(isolate, (double)hdr->frame_index)); // JS Number (lossy > 2^53)
+    
+    args.GetReturnValue().Set(ret);
 }
 
-void Initialize(Local<Object> exports) {
-  NODE_SET_METHOD(exports, "create", CreateSharedMemory);
-  NODE_SET_METHOD(exports, "setFormat", SetFormat);
-  NODE_SET_METHOD(exports, "getCapacity", GetCapacity);
-  NODE_SET_METHOD(exports, "getFrameBuffer", GetFrameBuffer);
-  NODE_SET_METHOD(exports, "publishFrame", PublishFrame);
-  NODE_SET_METHOD(exports, "readFrame", ReadFrame);
-  NODE_SET_METHOD(exports, "close", CloseSharedMemory);
-  NODE_SET_METHOD(exports, "getMetadata", GetMetadata);
-}
-
-NODE_MODULE(NODE_GYP_MODULE_NAME, Initialize)
+NODE_MODULE(NODE_GYP_MODULE_NAME, SharedMemory::Init)
